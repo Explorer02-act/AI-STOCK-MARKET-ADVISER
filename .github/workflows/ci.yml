@@ -54,9 +54,6 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run mocked financial data tests
-        run: pytest tests -q
-      
-      - name: Run mocked financial data tests
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: pytest tests -q
