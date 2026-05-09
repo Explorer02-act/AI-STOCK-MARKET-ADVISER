@@ -1,40 +1,113 @@
-import yfinance as yf
+from __future__ import annotations
+
+from typing import Any
+
 import pandas as pd
-import streamlit as st
+import yfinance as yf
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from backend.cache import cache
+from backend.data_pipeline.errors import StockDataUnavailable
+from backend.monitoring import UsageEvent, usage_monitor
 from configs.settings import DEFAULT_PERIOD, DEFAULT_INTERVAL
 
-@st.cache_data(ttl=300)
-def get_stock_price(ticker: str) -> dict:
-    try:
-        stock = yf.Ticker(ticker)
-        fast = stock.fast_info
-        return {
-            "ticker": ticker,
-            "name": ticker,
-            "current_price": round(fast.last_price, 2),
-            "previous_close": round(fast.previous_close, 2),
-            "market_cap": fast.market_cap,
-            "currency": fast.currency,
-            "sector": "N/A",
-        }
-    except Exception as e:
-        return {
-            "ticker": ticker,
-            "name": ticker,
-            "current_price": "N/A",
-            "previous_close": "N/A",
-            "market_cap": "N/A",
-            "currency": "INR",
-            "sector": "N/A",
-        }
 
-@st.cache_data(ttl=300)
-def get_stock_history(ticker: str, period: str = DEFAULT_PERIOD, interval: str = DEFAULT_INTERVAL) -> pd.DataFrame:
+def _safe_round(value: Any) -> float | str:
+    if value is None:
+        return "N/A"
     try:
-        stock = yf.Ticker(ticker)
-        return stock.history(period=period, interval=interval)
-    except Exception:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def _fast_value(fast_info: Any, key: str, default: Any = None) -> Any:
+    if isinstance(fast_info, dict):
+        return fast_info.get(key, default)
+    return getattr(fast_info, key, default)
+
+
+def _fallback_price(ticker: str, error: Exception | None = None) -> dict:
+    return {
+        "ticker": ticker,
+        "name": ticker,
+        "current_price": "N/A",
+        "previous_close": "N/A",
+        "market_cap": "N/A",
+        "currency": "INR",
+        "sector": "N/A",
+        "error": str(error) if error else None,
+    }
+
+
+@retry(
+    retry=retry_if_exception_type((StockDataUnavailable, TimeoutError, ConnectionError)),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    stop=stop_after_attempt(3),
+    reraise=True,
+)
+def _fetch_stock_price(ticker: str) -> dict:
+    stock = yf.Ticker(ticker)
+    fast = stock.fast_info
+    current_price = _fast_value(fast, "last_price")
+    if current_price is None:
+        raise StockDataUnavailable(f"No latest price returned for {ticker}")
+
+    return {
+        "ticker": ticker,
+        "name": ticker,
+        "current_price": _safe_round(current_price),
+        "previous_close": _safe_round(_fast_value(fast, "previous_close")),
+        "market_cap": _fast_value(fast, "market_cap", "N/A") or "N/A",
+        "currency": _fast_value(fast, "currency", "INR") or "INR",
+        "sector": "N/A",
+    }
+
+
+def get_stock_price(ticker: str) -> dict:
+    ticker = ticker.strip().upper()
+    cache_key = f"stock:price:{ticker}"
+    cached = cache.get_json(cache_key)
+    if cached:
+        usage_monitor.record(UsageEvent("redis", "stock_price_cache", "hit"))
+        return cached
+
+    try:
+        usage_monitor.record(UsageEvent("yfinance", "fast_info", "request"))
+        data = _fetch_stock_price(ticker)
+        cache.set_json(cache_key, data)
+        usage_monitor.record(UsageEvent("yfinance", "fast_info", "success"))
+        return data
+    except Exception as e:
+        usage_monitor.record_failure("yfinance", "fast_info", e)
+        return _fallback_price(ticker, e)
+
+
+@retry(
+    retry=retry_if_exception_type((StockDataUnavailable, TimeoutError, ConnectionError)),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    stop=stop_after_attempt(3),
+    reraise=True,
+)
+def _fetch_stock_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    stock = yf.Ticker(ticker)
+    history = stock.history(period=period, interval=interval)
+    if history is None or history.empty:
+        raise StockDataUnavailable(f"No history returned for {ticker}")
+    return history
+
+
+def get_stock_history(ticker: str, period: str = DEFAULT_PERIOD, interval: str = DEFAULT_INTERVAL) -> pd.DataFrame:
+    ticker = ticker.strip().upper()
+    try:
+        usage_monitor.record(UsageEvent("yfinance", "history", "request"))
+        history = _fetch_stock_history(ticker, period, interval)
+        usage_monitor.record(UsageEvent("yfinance", "history", "success"))
+        return history
+    except Exception as e:
+        usage_monitor.record_failure("yfinance", "history", e)
         return pd.DataFrame()
+
 
 def get_multiple_stocks(tickers: list) -> list:
     return [get_stock_price(t) for t in tickers]
