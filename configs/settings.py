@@ -9,6 +9,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # Groq
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+# News API
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+
 # App settings
 APP_NAME = "stock_market_analyser"
 DEBUG = os.getenv("DEBUG", "False").lower() == "true"
