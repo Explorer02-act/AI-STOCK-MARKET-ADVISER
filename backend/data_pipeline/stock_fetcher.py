@@ -9,6 +9,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from backend.cache import cache
 from backend.data_pipeline.errors import StockDataUnavailable
 from backend.monitoring import UsageEvent, usage_monitor
+from backend.market.indian_market import normalize_indian_symbol
 from configs.settings import DEFAULT_PERIOD, DEFAULT_INTERVAL
 
 
@@ -65,7 +66,7 @@ def _fetch_stock_price(ticker: str) -> dict:
 
 
 def get_stock_price(ticker: str) -> dict:
-    ticker = ticker.strip().upper()
+    ticker = normalize_indian_symbol(ticker)
     cache_key = f"stock:price:{ticker}"
     cached = cache.get_json(cache_key)
     if cached:
@@ -98,7 +99,7 @@ def _fetch_stock_history(ticker: str, period: str, interval: str) -> pd.DataFram
 
 
 def get_stock_history(ticker: str, period: str = DEFAULT_PERIOD, interval: str = DEFAULT_INTERVAL) -> pd.DataFrame:
-    ticker = ticker.strip().upper()
+    ticker = normalize_indian_symbol(ticker)
     try:
         usage_monitor.record(UsageEvent("yfinance", "history", "request"))
         history = _fetch_stock_history(ticker, period, interval)
@@ -111,3 +112,50 @@ def get_stock_history(ticker: str, period: str = DEFAULT_PERIOD, interval: str =
 
 def get_multiple_stocks(tickers: list) -> list:
     return [get_stock_price(t) for t in tickers]
+
+
+def get_fundamentals(ticker: str) -> dict:
+    ticker = normalize_indian_symbol(ticker)
+    cache_key = f"stock:fundamentals:{ticker}"
+    cached = cache.get_json(cache_key)
+    if cached:
+        usage_monitor.record(UsageEvent("redis", "fundamentals_cache", "hit"))
+        return cached
+
+    try:
+        usage_monitor.record(UsageEvent("yfinance", "info", "request"))
+        info = yf.Ticker(ticker).info or {}
+        data = {
+            "ticker": ticker,
+            "name": info.get("longName") or info.get("shortName") or ticker,
+            "sector": info.get("sector", "N/A"),
+            "industry": info.get("industry", "N/A"),
+            "trailing_pe": _safe_round(info.get("trailingPE")),
+            "forward_pe": _safe_round(info.get("forwardPE")),
+            "debt_to_equity": _safe_round(info.get("debtToEquity")),
+            "revenue_growth": _safe_round(info.get("revenueGrowth")),
+            "profit_margins": _safe_round(info.get("profitMargins")),
+            "return_on_equity": _safe_round(info.get("returnOnEquity")),
+            "market_cap": info.get("marketCap", "N/A") or "N/A",
+            "currency": info.get("financialCurrency") or info.get("currency") or "INR",
+        }
+        cache.set_json(cache_key, data, ttl_seconds=3600)
+        usage_monitor.record(UsageEvent("yfinance", "info", "success"))
+        return data
+    except Exception as e:
+        usage_monitor.record_failure("yfinance", "info", e)
+        return {
+            "ticker": ticker,
+            "name": ticker,
+            "sector": "N/A",
+            "industry": "N/A",
+            "trailing_pe": "N/A",
+            "forward_pe": "N/A",
+            "debt_to_equity": "N/A",
+            "revenue_growth": "N/A",
+            "profit_margins": "N/A",
+            "return_on_equity": "N/A",
+            "market_cap": "N/A",
+            "currency": "INR",
+            "error": str(e),
+        }
